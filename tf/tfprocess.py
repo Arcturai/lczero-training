@@ -125,16 +125,19 @@ class TFProcess:
         self.encoder_heads = self.cfg['model'].get('encoder_heads', 2)
         self.encoder_d_model = self.cfg['model'].get('encoder_d_model', 64)
         self.encoder_dff = self.cfg['model'].get('encoder_dff', 256)
+        self.alpha = np.math.pow(2. * self.encoder_layers, 0.25)
+        self.beta = np.math.pow(8. * self.encoder_layers, -0.25)
         self.pol_encoder_layers = self.cfg['model'].get('pol_encoder_layers', 0)
         self.pol_encoder_heads = self.cfg['model'].get('pol_encoder_heads', 2)
         self.pol_encoder_d_model = self.cfg['model'].get('pol_encoder_d_model', 64)
         self.pol_encoder_dff = self.cfg['model'].get('pol_encoder_dff', 96)
         self.policy_d_model = self.cfg['model'].get('policy_d_model', 64)
         self.dropout_rate = self.cfg['model'].get('dropout_rate', 0.0)
+        self.idr = float(self.cfg['model'].get('initial_drophead_rate', 0.0))
+        self.fdr = float(self.cfg['model'].get('final_drophead_rate', 0.0))
         precision = self.cfg['training'].get('precision', 'single')
         loss_scale = self.cfg['training'].get('loss_scale', 128)
-        self.virtual_batch_size = self.cfg['model'].get(
-            'virtual_batch_size', None)
+        self.virtual_batch_size = self.cfg['model'].get('virtual_batch_size', None)
 
         self.POS_ENC = apm.make_pos_enc()
 
@@ -151,7 +154,6 @@ class TFProcess:
         policy_head = self.cfg['model'].get('policy', 'convolution')
         value_head = self.cfg['model'].get('value', 'wdl')
         moves_left_head = self.cfg['model'].get('moves_left', 'v1')
-        net_body = self.cfg['model'].get('body', 'convolution')
         input_mode = self.cfg['model'].get('input_type', 'classic')
         default_activation = self.cfg['model'].get('default_activation', 'relu')
 
@@ -290,6 +292,7 @@ class TFProcess:
 
     def init_net(self):
         self.l2reg = tf.keras.regularizers.l2(l=0.5 * (0.0001))
+        self.drophead_rate = tf.Variable(self.idr, name='drophead_rate', trainable=False)
         input_var = tf.keras.Input(shape=(112, 8, 8))
         outputs = self.construct_net(input_var)
         self.model = tf.keras.Model(inputs=input_var, outputs=outputs)
@@ -823,14 +826,26 @@ class TFProcess:
                 if self.swa_enabled:
                     self.calculate_swa_summaries(test_batches, steps + 1)
 
-        # Determine learning rate
+        # Determine learning rate and DropHead rate
         lr_values = self.cfg['training']['lr_values']
         lr_boundaries = self.cfg['training']['lr_boundaries']
         steps_total = steps % self.cfg['training']['total_steps']
         self.lr = lr_values[bisect.bisect_right(lr_boundaries, steps_total)]
-        if self.warmup_steps > 0 and steps < self.warmup_steps:
-            self.lr = self.lr * tf.cast(steps + 1,
-                                        tf.float32) / self.warmup_steps
+        if self.warmup_steps > 0:
+            if steps < self.warmup_steps:
+                self.lr = self.lr * tf.cast(steps + 1,
+                                            tf.float32) / self.warmup_steps
+                self.drophead_rate.assign(self.idr * (1. - float(steps) / float(self.warmup_steps)))
+            elif steps == self.warmup_steps:
+                self.drophead_rate.assign(0.0)
+            else:
+                self.drophead_rate.assign(self.fdr * float(steps - self.warmup_steps) / float(steps_total - self.warmup_steps))
+        else:
+            self.drophead_rate.assign(self.idr - (self.idr - self.fdr) * float(steps) / float(steps_total))
+        ### TEMPORARY DEBUG CODE
+        if steps == 0 or steps == self.warmup_steps//2 or steps == self.warmup_steps or steps == 5000 or steps == 10_000 or steps == 1_000_000 or steps == 1_900_000:
+            print("steps: {} drophead rate: {}".format(steps, self.drophead_rate))
+        ###
 
         with tf.profiler.experimental.Trace("Train", step_num=steps):
             steps = self.train_step(steps, batch_size, batch_splits)
@@ -1152,15 +1167,22 @@ class TFProcess:
         reshaped = tf.reshape(inputs, (batch_size, 64, num_heads, depth))
         return tf.transpose(reshaped, perm=[0, 2, 1, 3])  # (batch_size, num_heads, 64, depth)
 
-    def scaled_dot_product_attention(self, q, k, v):
+    def scaled_dot_product_attention(self, q, k, v, name: str = None):
         matmul_qk = tf.matmul(q, k, transpose_b=True)
+        # tf.shape(q) causes bugs in some TF versions, while q.shape causes bugs in others
+        #batch_size = tf.shape(q)[0]
+        batch_size = q.shape[0]
         dk = tf.cast(tf.shape(k)[-1], self.model_dtype)
         scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
         attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
         output = tf.matmul(attention_weights, v)
+        # DropHead
+        heads = scaled_attention_logits.shape[1]
+        output = tf.keras.layers.Dropout(self.drophead_rate, noise_shape=(batch_size, heads, 1, 1),
+                                         name=name + "/drophead")(output)
+
         return output, scaled_attention_logits
 
-    # multi-head attention in encoder blocks
     def mha(self, inputs, emb_size, d_model, num_heads, initializer, name):
         assert d_model % num_heads == 0
         depth = d_model // num_heads
@@ -1173,7 +1195,7 @@ class TFProcess:
         q = self.split_heads(q, batch_size, num_heads, depth)
         k = self.split_heads(k, batch_size, num_heads, depth)
         v = self.split_heads(v, batch_size, num_heads, depth)
-        scaled_attention, attention_weights = self.scaled_dot_product_attention(q, k, v)
+        scaled_attention, attention_weights = self.scaled_dot_product_attention(q, k, v, name=name)
         if num_heads > 1:
             scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
             scaled_attention = tf.reshape(scaled_attention, (batch_size, -1, d_model))  # concatenate heads
@@ -1187,24 +1209,23 @@ class TFProcess:
                                        name=name + "/dense1")(inputs)
         return tf.keras.layers.Dense(emb_size, kernel_initializer=initializer, name=name + "/dense2")(dense1)
 
-    def encoder_layer(self, inputs, emb_size, d_model, num_heads, dff, name, training):
+    def encoder_layer(self, inputs, emb_size, d_model, num_heads, dff, name):
         # DeepNorm
-        alpha = tf.cast(tf.math.pow(2. * self.encoder_layers, 0.25), self.model_dtype)
-        beta = tf.cast(tf.math.pow(8. * self.encoder_layers, -0.25), self.model_dtype)
-        xavier_norm = tf.keras.initializers.VarianceScaling(scale=beta, mode='fan_avg', distribution='truncated_normal')
+        xavier_norm = tf.keras.initializers.VarianceScaling(scale=self.beta, mode='fan_avg',
+                                                            distribution='truncated_normal')
         # multihead attention
         attn_output, attn_wts = self.mha(inputs, emb_size, d_model, num_heads, xavier_norm, name=name + "/mha")
         # dropout for weight regularization
-        attn_output = tf.keras.layers.Dropout(self.dropout_rate, name=name + "/dropout1")(attn_output, training=training)
+        attn_output = tf.keras.layers.Dropout(self.dropout_rate, name=name + "/dropout1")(attn_output)
         # skip connection + layernorm
-        out1 = tf.keras.layers.LayerNormalization(epsilon=1e-6, name=name + "/ln1")(inputs * alpha + attn_output)
+        out1 = tf.keras.layers.LayerNormalization(epsilon=1e-6, name=name + "/ln1")(inputs * self.alpha + attn_output)
         # feed-forward network
         ffn_output = self.ffn(out1, emb_size, dff, xavier_norm, name=name + "/ffn")
-        ffn_output = tf.keras.layers.Dropout(self.dropout_rate, name=name + "/dropout2")(ffn_output, training=training)
-        out2 = tf.keras.layers.LayerNormalization(epsilon=1e-6, name=name + "/ln2")(out1 * alpha + ffn_output)
+        ffn_output = tf.keras.layers.Dropout(self.dropout_rate, name=name + "/dropout2")(ffn_output)
+        out2 = tf.keras.layers.LayerNormalization(epsilon=1e-6, name=name + "/ln2")(out1 * self.alpha + ffn_output)
         return out2, attn_wts
 
-    def construct_net(self, inputs):
+    def construct_net(self, inputs, name: str = ''):
         if self.RESIDUAL_BLOCKS > 0:
             flow = self.conv_block(inputs,
                                    filter_size=3,
@@ -1268,8 +1289,7 @@ class TFProcess:
                 for i in range(self.encoder_layers):
                     flow, attn_wts_l = self.encoder_layer(flow, self.embedding_size, self.encoder_d_model,
                                                           self.encoder_heads, self.encoder_dff,
-                                                          name='encoder_{}'.format(i + 1), training=True
-                                                          )
+                                                          name='encoder_{}'.format(i + 1))
                     attn_wts.append(attn_wts_l)
                 flow_ = flow
             else:

@@ -428,6 +428,9 @@ class Net:
             if 'headcount' in tf_name:
                 # headcount is set with set_headcount()
                 continue
+            if 'drophead' in name:
+                # drophead rate is not needed for backend weights 
+                continue
 
             pb_name, block, encoder_block = self.tf_name_to_pb_name(name)
 
@@ -542,6 +545,9 @@ class Net:
         del self.pb.weights.residual[:]
 
         for name, weights in all_weights:
+            if 'drophead' in name:
+                # drophead rate is not needed for backend weights
+                continue
             layers = name.split('/')
             weights_name = layers[-1]
             if weights.ndim == 4:
@@ -571,7 +577,7 @@ class Net:
                 if 'stddev:' in weights_name:
                     weights = np.square(weights) - 1e-5
                     name = name.replace('stddev', 'variance')
-            
+
             if self.pb.format.network_format.input < pb.NetworkFormat.INPUT_112_WITH_CANONICALIZATION_HECTOPLIES:
                 if name == 'input/conv2d/kernel:0':
                     # 50 move rule is the 110th input, or 109 starting from 0.
