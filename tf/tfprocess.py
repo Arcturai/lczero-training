@@ -548,6 +548,9 @@ class TFProcess:
             if 'renorm' in weight.name:
                 # Renorm variables are not populated.
                 continue
+            if 'drophead' in weight.name:
+                # DropHead rate is set in the training loop.
+                continue
 
             try:
                 new_weight = new_weights[weight.name]
