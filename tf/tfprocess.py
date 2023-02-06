@@ -154,6 +154,7 @@ class TFProcess:
         policy_head = self.cfg['model'].get('policy', 'convolution')
         value_head = self.cfg['model'].get('value', 'wdl')
         moves_left_head = self.cfg['model'].get('moves_left', 'v1')
+        net_body = self.cfg['model'].get('body', 'convolution')
         input_mode = self.cfg['model'].get('input_type', 'classic')
         default_activation = self.cfg['model'].get('default_activation', 'relu')
 
@@ -829,7 +830,8 @@ class TFProcess:
         # Determine learning rate and DropHead rate
         lr_values = self.cfg['training']['lr_values']
         lr_boundaries = self.cfg['training']['lr_boundaries']
-        steps_total = steps % self.cfg['training']['total_steps']
+        total_steps = self.cfg['training']['total_steps']
+        steps_total = steps % total_steps
         self.lr = lr_values[bisect.bisect_right(lr_boundaries, steps_total)]
         if self.warmup_steps > 0:
             if steps < self.warmup_steps:
@@ -839,9 +841,9 @@ class TFProcess:
             elif steps == self.warmup_steps:
                 self.drophead_rate.assign(0.0)
             else:
-                self.drophead_rate.assign(self.fdr * float(steps - self.warmup_steps) / float(steps_total - self.warmup_steps))
+                self.drophead_rate.assign(self.fdr * float(steps - self.warmup_steps) / float(total_steps - self.warmup_steps))
         else:
-            self.drophead_rate.assign(self.idr - (self.idr - self.fdr) * float(steps) / float(steps_total))
+            self.drophead_rate.assign(self.idr - (self.idr - self.fdr) * float(steps) / float(total_steps))
         ### TEMPORARY DEBUG CODE
         if steps == 0 or steps == self.warmup_steps//2 or steps == self.warmup_steps or steps == 5000 or steps == 10_000 or steps == 1_000_000 or steps == 1_900_000:
             print("steps: {} drophead rate: {}".format(steps, self.drophead_rate))
