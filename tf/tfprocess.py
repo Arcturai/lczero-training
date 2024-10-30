@@ -1293,7 +1293,8 @@ class TFProcess:
 
     def mha(self, inputs, emb_size: int, d_model: int, num_heads: int,
             initializer, name: str):
-        assert d_model % num_heads == 0
+        assert d_model % num_heads == 0,\
+            "'encoder_d_model' must be divisible by 'encoder_heads'"
         depth = d_model // num_heads
         # query, key, and value vectors for self-attention
         # inputs b, 64, sz
@@ -1315,12 +1316,14 @@ class TFProcess:
 
         scaled_attention, attention_weights = self.scaled_dot_product_attention(
             q, k, v, name=name, inputs=inputs)
+
+        # concatenate heads
         if num_heads > 1:
             scaled_attention = tf.transpose(scaled_attention,
                                             perm=[0, 2, 1, 3])
             scaled_attention = tf.reshape(
                 scaled_attention,
-                (batch_size, -1, d_model))  # concatenate heads
+                (batch_size, -1, d_model))
 
         # final dense layer
         output = tf.keras.layers.Dense(
@@ -1428,7 +1431,8 @@ class TFProcess:
 
     def create_encoder_body(self, inputs, embedding_size):
         # Policy head
-        assert self.POLICY_HEAD == pb.NetworkFormat.POLICY_ATTENTION
+        assert self.POLICY_HEAD == pb.NetworkFormat.POLICY_ATTENTION,\
+            "Attention Policy must be used with a transformer body"
 
         # do some input processing
         if self.use_smolgen:
@@ -1469,8 +1473,8 @@ class TFProcess:
 
     def apply_promotion_logits(self, queries, keys, attn_wts):
         # PAWN PROMOTION: create promotion logits using scalar offsets generated from the promotion-rank keys
-        dk = tf.math.sqrt(tf.cast(tf.shape(keys)[-1],
-                                  self.model_dtype))  # constant for scaling
+        sqrt_dk = tf.math.sqrt(tf.cast(tf.shape(keys)[-1], self.model_dtype))  # constant for scaling
+
         promotion_keys = keys[:, -8:, :]
         # queen, rook, bishop, knight order
         promotion_offsets = tf.keras.layers.Dense(
@@ -1479,7 +1483,7 @@ class TFProcess:
             name='policy/attention/ppo',
             use_bias=False)(promotion_keys)
         promotion_offsets = tf.transpose(promotion_offsets,
-                                         perm=[0, 2, 1]) * dk  # Bx4x8
+                                         perm=[0, 2, 1]) * sqrt_dk  # Bx4x8  ### SCALING IS NEEDED?
         # knight offset is added to the other three
         promotion_offsets = promotion_offsets[:, :
                                               3, :] + promotion_offsets[:,
@@ -1510,8 +1514,8 @@ class TFProcess:
             [-1, 8, 24])  # logits now alternate a7a8q,a7a8r,a7a8b,...,
 
         # scale the logits by dividing them by sqrt(d_model) to stabilize gradients
-        promotion_logits = promotion_logits / dk  # Bx8x24 (8 from-squares, 3x8 promotions)
-        policy_attn_logits = matmul_qk / dk  # Bx64x64 (64 from-squares, 64 to-squares)
+        promotion_logits = promotion_logits / sqrt_dk  # Bx8x24 (8 from-squares, 3x8 promotions)
+        policy_attn_logits = matmul_qk / sqrt_dk  # Bx64x64 (64 from-squares, 64 to-squares)
 
         attn_wts.append(promotion_logits)
         attn_wts.append(policy_attn_logits)
