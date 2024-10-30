@@ -69,6 +69,9 @@ class Net:
     def set_pol_headcount(self, headcount):
         self.pb.weights.pol_headcount = headcount
 
+    def set_pol_mha_headcount(self, headcount):
+        self.pb.weights.pol_mha_headcount = headcount
+
     def set_valueformat(self, value):
         self.pb.format.network_format.value = value
 
@@ -334,6 +337,8 @@ class Net:
                 n = 3
             elif l == 'ppo':
                 n = 4
+            elif l == 'hs':
+                n = 5
             else:
                 raise ValueError(
                     'Unable to decode attn_policy weight {}/{}'.format(l, w))

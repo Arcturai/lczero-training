@@ -186,6 +186,12 @@ class TFProcess:
             'pol_encoder_dff', (self.RESIDUAL_FILTERS * 1.5) // 1)
         self.policy_d_model = self.cfg['model'].get('policy_d_model',
                                                     self.RESIDUAL_FILTERS)
+        self.pol_mha_heads = self.cfg['model'].get('pol_mha_heads', 1)
+        self.pol_mha_onQ = self.cfg['model'].get('pol_mha_onQ', True)
+        # self.pol_mha_onK = self.cfg['model'].get('pol_mha_onK', False)
+        # # for now, until both supported
+        # assert self.pol_mha_onQ != self.pol_mha_onK
+        self.pol_mha_softmax = self.cfg['model'].get('pol_mha_softmax_method', True)
 
         #encoder body
         self.input_gate = self.cfg['model'].get('input_gate')
@@ -243,6 +249,7 @@ class TFProcess:
             self.POLICY_HEAD = pb.NetworkFormat.POLICY_ATTENTION
             if self.pol_encoder_layers > 0:
                 self.net.set_pol_headcount(self.pol_encoder_heads)
+            self.net.set_pol_mha_headcount(self.pol_mha_heads)
         else:
             raise ValueError(
                 "Unknown policy head format: {}".format(policy_head))
@@ -482,6 +489,36 @@ class TFProcess:
 
         self.policy_uniform_loss_fn = policy_uniform_loss
 
+        def phs_entropy(phs):
+            if phs is not None:
+                softmaxed = tf.nn.softmax(phs, axis=-1)
+                return tf.math.negative(
+                    tf.reduce_mean(  # Bx64 -> 1
+                        tf.reduce_sum(tf.math.xlogy(softmaxed, softmaxed),
+                                      axis=2)))  # Bx64xH -> Bx64
+
+        self.phs_entropy_fn = phs_entropy
+
+        def phs_sq_sens(phs):
+            if phs is not None:
+                softmaxed = tf.nn.softmax(phs, axis=-1)
+                choices = tf.reduce_sum(softmaxed, axis=1)   # Bx64xH -> BxH
+                choices = choices ** 2.
+                sens = 1. / tf.reduce_mean(choices, axis=1)  # BxH -> B
+                return tf.reduce_mean(sens)  # B -> 1
+
+        self.phs_sq_sens_fn = phs_sq_sens
+
+        def phs_pos_sens(phs):
+            if phs is not None:
+                softmaxed = tf.nn.softmax(phs, axis=-1)
+                choices = tf.reduce_sum(softmaxed, axis=0)   # Bx64xH -> 64xH
+                choices = choices ** 2.
+                sens = 1. / tf.reduce_mean(choices, axis=1)  # 64xH -> 64
+                return tf.reduce_mean(sens)  # 64 -> 1
+
+        self.phs_pos_sens_fn = phs_pos_sens
+
         q_ratio = self.cfg['training'].get('q_ratio', 0)
         assert 0 <= q_ratio <= 1
 
@@ -591,6 +628,9 @@ class TFProcess:
             Metric('ML Mean', 'Moves Left Mean Error'),
             Metric('P Entropy', 'Policy Entropy'),
             Metric('P UL', 'Policy UL'),
+            Metric('PHS Sq-Sens', 'Policy Head Selection Square-Sensitivity'),
+            Metric('PHS Pos-Sens', 'Policy Head Selection Position-Sensitivity'),
+            Metric('PHS Entropy', 'Policy Head Selection Entropy'),
         ]
 
         # Set adaptive learning rate during training
@@ -1009,6 +1049,12 @@ class TFProcess:
         policy_accuracy = self.policy_accuracy_fn(y, policy)
         policy_entropy = self.policy_entropy_fn(y, policy)
         policy_ul = self.policy_uniform_loss_fn(y, policy)
+        policy_head_selection = None
+        if self.pol_mha_heads > 1:
+            policy_head_selection = outputs[-1]
+        phs_entropy = self.phs_entropy_fn(policy_head_selection)
+        phs_sq_sens = self.phs_sq_sens_fn(policy_head_selection)
+        phs_pos_sens = self.phs_pos_sens_fn(policy_head_selection)
         if self.wdl:
             value_loss = self.value_loss_fn(self.qMix(z, q), value)
             mse_loss = self.mse_loss_fn(self.qMix(z, q), value)
@@ -1034,6 +1080,9 @@ class TFProcess:
             moves_left_mean_error,
             policy_entropy,
             policy_ul,
+            phs_entropy,
+            phs_sq_sens,
+            phs_pos_sens,
         ]
         return metrics
 
@@ -1457,8 +1506,8 @@ class TFProcess:
                                      activation=self.DEFAULT_ACTIVATION,
                                      name='embedding')(flow)
 
-        # !!! input gate
-        flow = ma_gating(flow, name='embedding')
+        # # !!! input gate
+        # flow = ma_gating(flow, name='embedding')
         attn_wts = []
         for i in range(self.encoder_layers):
             flow, attn_wts_l = self.encoder_layer(flow,
@@ -1471,7 +1520,7 @@ class TFProcess:
             attn_wts.append(attn_wts_l)
         return flow, attn_wts
 
-    def apply_promotion_logits(self, queries, keys, attn_wts):
+    def apply_promotion_logits(self, queries, keys, head_selection, attn_wts):
         # PAWN PROMOTION: create promotion logits using scalar offsets generated from the promotion-rank keys
         sqrt_dk = tf.math.sqrt(tf.cast(tf.shape(keys)[-1], self.model_dtype))  # constant for scaling
 
@@ -1485,14 +1534,36 @@ class TFProcess:
         promotion_offsets = tf.transpose(promotion_offsets,
                                          perm=[0, 2, 1]) * sqrt_dk  # Bx4x8  ### SCALING IS NEEDED?
         # knight offset is added to the other three
-        promotion_offsets = promotion_offsets[:, :
-                                              3, :] + promotion_offsets[:,
-                                                                        3:4, :]
+        promotion_offsets = promotion_offsets[:, :3, :] + promotion_offsets[:, 3:4, :]
+
+        pol_d_model = self.policy_d_model
+        num_heads = self.pol_mha_heads
+        assert pol_d_model % num_heads == 0,\
+            "'policy_d_model' must be divisible by 'pol_mha_heads'"
+        depth = pol_d_model // num_heads
+        # split q, k and v into smaller vectors of size 'depth' -- one for each head in multi-head attention
+        batch_size = tf.shape(queries)[0]
+        # split heads: (b, 64, d_model) -> (b, num_heads, 64, depth) -- does nothing if if num_heads < 2
+        queries = self.split_heads(queries, batch_size, num_heads, depth)
+        keys = self.split_heads(keys, batch_size, num_heads, depth)
 
         # POLICY SELF-ATTENTION: self-attention weights are interpreted as from->to policy
         matmul_qk = tf.matmul(
             queries, keys,
-            transpose_b=True)  # Bx64x64 (from 64 queries, 64 keys)
+            transpose_b=True)  # Bx64x64 - or - BxHx64x64
+
+        # select heads:
+        if head_selection is not None:  # if num_heads > 1:
+            head_selection = tf.transpose(head_selection, perm=[0, 2, 1])  # Bx64xH -> BxHx64
+            if self.pol_mha_onQ:
+                # select on Queries:
+                head_selection = tf.expand_dims(head_selection, axis=3)  # BxHx64 -> BxHx64x1
+            else:
+                # select on Keys:
+                head_selection = tf.expand_dims(head_selection, axis=2)  # BxHx64 -> BxHx1x64:
+            # Weight the heads per Query/Key "selection"
+            matmul_qk = tf.math.multiply(matmul_qk, head_selection)  # -> BxHx64x64
+            matmul_qk = tf.math.reduce_sum(matmul_qk, axis=1)  # BxHx64x64 -> Bx64x64
 
         # q, r, and b promotions are offset from the default promotion logit (knight)
         n_promo_logits = matmul_qk[:, -16:-8,
@@ -1590,6 +1661,7 @@ class TFProcess:
                     attn_wts.append(attn_wts_l)
 
             # create queries and keys for policy self-attention
+            # b, 64, d_model
             queries = tf.keras.layers.Dense(self.policy_d_model,
                                             kernel_initializer='glorot_normal',
                                             name='policy/attention/wq')(tokens)
@@ -1597,7 +1669,26 @@ class TFProcess:
                                          kernel_initializer='glorot_normal',
                                          name='policy/attention/wk')(tokens)
 
-            h_fc1 = self.apply_promotion_logits(queries, keys, attn_wts)
+            head_selection = None
+            if self.pol_mha_heads > 1:
+                # b x 64 x heads
+                head_selection_logits = tf.keras.layers.Dense(self.pol_mha_heads,
+                                                       kernel_initializer='glorot_normal',
+                                                       use_bias=False,                      # use_bias true or false?
+                                                       name='policy/attention/hs')(tokens)  # project Queries instead?
+                # scale down head_selection?
+                # head_selection_logits = head_selection_logits / tf.math.sqrt(tf.cast(tf.shape(tokens)[-1], self.model_dtype))
+                if self.pol_mha_softmax:
+                    # softmax method:
+                    head_selection = tf.nn.softmax(head_selection_logits, axis=-1)
+                else:
+                    # pick the highest method:
+                    # Find the maximum value in the tensor (b x 64 x 1)
+                    max_value = tf.reduce_max(head_selection_logits, axis=-1)
+                    # Create a boolean mask and cast it to 1s and 0s (b x 64 x heads)
+                    head_selection = tf.cast(tf.equal(head_selection, max_value), self.model_dtype)
+
+            h_fc1 = self.apply_promotion_logits(queries, keys, head_selection, attn_wts)
 
         else:
             raise ValueError("Unknown policy head type {}".format(
@@ -1667,14 +1758,12 @@ class TFProcess:
             h_fc5 = None
 
         # attention weights added as optional output for analysis -- ignored by backend
+        outputs = [h_fc1, h_fc3]
+        if self.moves_left:
+            outputs.append(h_fc5)
         if self.POLICY_HEAD == pb.NetworkFormat.POLICY_ATTENTION:
-            if self.moves_left:
-                outputs = [h_fc1, h_fc3, h_fc5, attn_wts]
-            else:
-                outputs = [h_fc1, h_fc3, attn_wts]
-        elif self.moves_left:
-            outputs = [h_fc1, h_fc3, h_fc5]
-        else:
-            outputs = [h_fc1, h_fc3]
+            outputs.append(attn_wts)
+            if self.pol_mha_heads > 1:
+                outputs.append(head_selection_logits)
 
         return outputs
