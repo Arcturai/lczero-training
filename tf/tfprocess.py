@@ -489,35 +489,37 @@ class TFProcess:
 
         self.policy_uniform_loss_fn = policy_uniform_loss
 
-        def phs_entropy(phs):
-            if phs is not None:
+        if self.pol_mha_heads > 1:
+            def phs_entropy(phs):
                 softmaxed = tf.nn.softmax(phs, axis=-1)
                 return tf.math.negative(
                     tf.reduce_mean(  # Bx64 -> 1
                         tf.reduce_sum(tf.math.xlogy(softmaxed, softmaxed),
                                       axis=2)))  # Bx64xH -> Bx64
 
-        self.phs_entropy_fn = phs_entropy
+            self.phs_entropy_fn = phs_entropy
 
-        def phs_sq_sens(phs):
-            if phs is not None:
+            def phs_sq_sens(phs):
+                squares = tf.cast(tf.shape(phs)[1], self.model_dtype)  # should be 64
+                heads = tf.cast(self.pol_mha_heads, self.model_dtype)
                 softmaxed = tf.nn.softmax(phs, axis=-1)
                 choices = tf.reduce_sum(softmaxed, axis=1)   # Bx64xH -> BxH
                 choices = choices ** 2.
-                sens = 1. / tf.reduce_mean(choices, axis=1)  # BxH -> B
+                sens = (squares / heads)**2 / tf.reduce_mean(choices, axis=1)  # BxH -> B
                 return tf.reduce_mean(sens)  # B -> 1
 
-        self.phs_sq_sens_fn = phs_sq_sens
+            self.phs_sq_sens_fn = phs_sq_sens
 
-        def phs_pos_sens(phs):
-            if phs is not None:
+            def phs_pos_sens(phs):
+                batch_size = tf.cast(tf.shape(phs)[0], self.model_dtype)
+                heads = tf.cast(self.pol_mha_heads, self.model_dtype)
                 softmaxed = tf.nn.softmax(phs, axis=-1)
                 choices = tf.reduce_sum(softmaxed, axis=0)   # Bx64xH -> 64xH
                 choices = choices ** 2.
-                sens = 1. / tf.reduce_mean(choices, axis=1)  # 64xH -> 64
+                sens = (batch_size / heads)**2  / tf.reduce_mean(choices, axis=1)  # 64xH -> 64
                 return tf.reduce_mean(sens)  # 64 -> 1
 
-        self.phs_pos_sens_fn = phs_pos_sens
+            self.phs_pos_sens_fn = phs_pos_sens
 
         q_ratio = self.cfg['training'].get('q_ratio', 0)
         assert 0 <= q_ratio <= 1
@@ -628,9 +630,9 @@ class TFProcess:
             Metric('ML Mean', 'Moves Left Mean Error'),
             Metric('P Entropy', 'Policy Entropy'),
             Metric('P UL', 'Policy UL'),
+            Metric('PHS Entropy', 'Policy Head Selection Entropy'),
             Metric('PHS Sq-Sens', 'Policy Head Selection Square-Sensitivity'),
             Metric('PHS Pos-Sens', 'Policy Head Selection Position-Sensitivity'),
-            Metric('PHS Entropy', 'Policy Head Selection Entropy'),
         ]
 
         # Set adaptive learning rate during training
@@ -1049,12 +1051,6 @@ class TFProcess:
         policy_accuracy = self.policy_accuracy_fn(y, policy)
         policy_entropy = self.policy_entropy_fn(y, policy)
         policy_ul = self.policy_uniform_loss_fn(y, policy)
-        policy_head_selection = None
-        if self.pol_mha_heads > 1:
-            policy_head_selection = outputs[-1]
-        phs_entropy = self.phs_entropy_fn(policy_head_selection)
-        phs_sq_sens = self.phs_sq_sens_fn(policy_head_selection)
-        phs_pos_sens = self.phs_pos_sens_fn(policy_head_selection)
         if self.wdl:
             value_loss = self.value_loss_fn(self.qMix(z, q), value)
             mse_loss = self.mse_loss_fn(self.qMix(z, q), value)
@@ -1070,6 +1066,15 @@ class TFProcess:
         else:
             moves_left_loss = tf.constant(0.)
             moves_left_mean_error = tf.constant(0.)
+        if self.pol_mha_heads > 1:
+            policy_head_selection = outputs[-1]
+            phs_entropy = self.phs_entropy_fn(policy_head_selection)
+            phs_sq_sens = self.phs_sq_sens_fn(policy_head_selection)
+            phs_pos_sens = self.phs_pos_sens_fn(policy_head_selection)
+        else:
+            phs_entropy = tf.constant(0.)
+            phs_sq_sens = tf.constant(0.)
+            phs_pos_sens = tf.constant(0.)
         metrics = [
             policy_loss,
             value_loss,
@@ -1554,6 +1559,7 @@ class TFProcess:
 
         # select heads:
         if head_selection is not None:  # if num_heads > 1:
+            attn_wts.append(matmul_qk)
             head_selection = tf.transpose(head_selection, perm=[0, 2, 1])  # Bx64xH -> BxHx64
             if self.pol_mha_onQ:
                 # select on Queries:
